@@ -17,7 +17,6 @@ Credentials are read from environment variables:
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import re
 import sys
@@ -127,23 +126,6 @@ def card_is_eligible_for_set(card: Locator, keyword: str) -> tuple[bool, str]:
     return True, "ok"
 
 
-def extract_base_price(card: Locator) -> int | None:
-    """Return the ミニモ限定価格 (post-arrow / smaller value), used as the discount base."""
-    text = card_text(card)
-    matches = re.findall(r"[¥￥]\s*([\d,]+)", text)
-    prices: list[int] = []
-    for m in matches:
-        try:
-            prices.append(int(m.replace(",", "")))
-        except ValueError:
-            pass
-    return min(prices) if prices else None
-
-
-def calc_discounted_price(base_price: int) -> int:
-    return math.floor(base_price * (1 - DISCOUNT_RATE_PERCENT / 100))
-
-
 def _modal(page: Page) -> Locator:
     modal = page.locator('[role="dialog"], [class*="modal"], [class*="Modal"]').filter(
         has_text="直前割"
@@ -161,33 +143,16 @@ def _input_after_label(modal: Locator, label_text: str) -> Locator:
 
 
 def set_discount_on_card(page: Page, card: Locator) -> None:
-    base_price = extract_base_price(card)
-    if base_price is None:
-        raise RuntimeError("could not parse base price from card")
-    target_price = calc_discounted_price(base_price)
-    print(f"  base={base_price} -> target={target_price}")
+    print(f"  applying {DISCOUNT_RATE_PERCENT}% discount on: {extract_menu_name(card)[:60]}")
 
     card.locator('button:has-text("直前割作成")').first.click()
     modal = _modal(page)
 
-    price_input = _input_after_label(modal, "直前割価格")
-    price_input.click()
-    price_input.fill("")
-    price_input.fill(str(target_price))
-    price_input.press("Tab")
-    page.wait_for_timeout(500)
-
     rate_input = _input_after_label(modal, "割引率")
-    try:
-        rate_value = rate_input.input_value(timeout=2_000).strip()
-        if rate_value and rate_value.isdigit() and int(rate_value) < DISCOUNT_RATE_PERCENT:
-            print(f"  rate auto-calculated to {rate_value}%, correcting to {DISCOUNT_RATE_PERCENT}%")
-            rate_input.click()
-            rate_input.fill(str(DISCOUNT_RATE_PERCENT))
-            rate_input.press("Tab")
-            page.wait_for_timeout(500)
-    except PWTimeoutError:
-        pass
+    rate_input.click()
+    rate_input.fill(str(DISCOUNT_RATE_PERCENT))
+    rate_input.press("Tab")
+    page.wait_for_timeout(500)
 
     submit = modal.locator('button:has-text("直前割を設定")').first
     submit.wait_for(state="visible", timeout=5_000)
@@ -204,15 +169,17 @@ def set_discount_on_card(page: Page, card: Locator) -> None:
 
 
 def remove_discount_on_card(page: Page, card: Locator) -> None:
+    print(f"  removing discount on: {extract_menu_name(card)[:60]}")
     card.locator('button:has-text("直前割編集")').first.click()
     modal = _modal(page)
-    modal.locator('button:has-text("直前割を終了する")').first.click()
+    modal.get_by_text("直前割を終了する", exact=True).first.click()
+    page.wait_for_timeout(800)
 
     for label in ("終了する", "OK", "はい"):
-        confirm = page.locator(f'button:has-text("{label}")')
+        confirm = page.get_by_role("button", name=label, exact=True)
         try:
-            if confirm.count() > 0:
-                confirm.last.click(timeout=3_000)
+            if confirm.count() > 0 and confirm.first.is_visible(timeout=500):
+                confirm.first.click(timeout=2_000)
                 break
         except PWTimeoutError:
             continue
