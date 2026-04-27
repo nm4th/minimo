@@ -1,11 +1,6 @@
 name: minimo-discount
 
 on:
-  schedule:
-    # 00:07 JST (= 15:07 UTC previous day): apply last-minute discount
-    - cron: '7 15 * * *'
-    # 18:07 JST (= 09:07 UTC same day): remove last-minute discount
-    - cron: '7 9 * * *'
   workflow_dispatch:
     inputs:
       action:
@@ -39,38 +34,12 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Determine action
-        id: action
-        run: |
-          case "${{ github.event.schedule }}" in
-            '7 15 * * *') echo "value=set"    >> "$GITHUB_OUTPUT" ;;
-            '7 9 * * *')  echo "value=remove" >> "$GITHUB_OUTPUT" ;;
-            *)            echo "value=${{ inputs.action }}" >> "$GITHUB_OUTPUT" ;;
-          esac
-
-      - name: Log schedule lag
-        if: github.event_name == 'schedule'
-        env:
-          SCHEDULE_CRON: ${{ github.event.schedule }}
-        run: |
-          minute=$(echo "$SCHEDULE_CRON" | awk '{print $1}')
-          hour=$(echo "$SCHEDULE_CRON" | awk '{print $2}')
-          scheduled_today_utc=$(date -u -d "today ${hour}:${minute}:00" +%s)
-          now_utc=$(date -u +%s)
-          if [ "$now_utc" -lt "$scheduled_today_utc" ]; then
-            scheduled_today_utc=$(date -u -d "yesterday ${hour}:${minute}:00" +%s)
-          fi
-          lag=$(( now_utc - scheduled_today_utc ))
-          echo "scheduled (UTC):  $(date -u -d @${scheduled_today_utc} +'%Y-%m-%d %H:%M:%S')"
-          echo "started   (UTC):  $(date -u -d @${now_utc} +'%Y-%m-%d %H:%M:%S')"
-          echo "lag:              ${lag}s ($(( lag / 60 ))m $(( lag % 60 ))s)"
-
       - name: Run
         env:
           MINIMO_SALON_ID:    ${{ secrets.MINIMO_SALON_ID }}
           MINIMO_PASSWORD:    ${{ secrets.MINIMO_PASSWORD }}
           MINIMO_STAFF_HASH:  ${{ secrets.MINIMO_STAFF_HASH }}
-          ACTION:             ${{ steps.action.outputs.value }}
+          ACTION:             ${{ inputs.action }}
           MENU_FILTER:        ${{ inputs.menu }}
         run: timeout 300 python minimo_discount.py "$ACTION"
 
