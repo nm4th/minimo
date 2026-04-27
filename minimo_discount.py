@@ -2,15 +2,21 @@
 """Minimo last-minute discount automation.
 
 Usage:
-    python minimo_discount.py set     # apply 10% last-minute discount to eligible menus
-    python minimo_discount.py remove  # remove all currently-set last-minute discounts
+    python minimo_discount.py set                 # apply discount to all eligible menus
+    python minimo_discount.py remove              # remove discount from all menus
+    python minimo_discount.py set --menu "人気No.2"     # test: only that one menu
+    python minimo_discount.py remove --menu "人気No.2"  # test: only that one menu
+
+In test mode (--menu / MENU_FILTER env), only the menu whose name contains the given
+substring is processed, and eligibility filters (平日限定 / 新規 / exclude keywords)
+are skipped — only the required button presence is checked.
 
 Credentials are read from environment variables:
     MINIMO_SALON_ID, MINIMO_PASSWORD, MINIMO_STAFF_HASH
 """
 from __future__ import annotations
 
-import math
+import argparse
 import os
 import re
 import sys
@@ -56,22 +62,31 @@ def login(page: Page, salon_id: str, password: str) -> None:
 def open_menu_page(page: Page, staff_hash: str) -> None:
     page.goto(MENU_URL_TEMPLATE.format(staff_hash=staff_hash), wait_until="networkidle")
     page.wait_for_timeout(2000)
+    print(f"menu page url: {page.url}")
+    page.screenshot(path="menu-page.png", full_page=True)
 
 
 def menu_cards(page: Page) -> list[Locator]:
-    """Each menu row/card. Best-effort selectors; verify on first run."""
-    candidates = [
-        '[class*="menu-item"]',
-        '[class*="MenuItem"]',
-        '[class*="menu-card"]',
-        'li:has(button:has-text("直前割"))',
-        'div:has(> button:has-text("直前割作成"))',
-        'div:has(> button:has-text("直前割編集"))',
-    ]
-    for sel in candidates:
+    """Find menu rows. Anchor on 直前割 buttons (uniquely present on menu rows)
+    and walk up to the smallest ancestor that also contains '通常料金' (which
+    every menu card displays). Falls back to class-based selectors."""
+    buttons = page.locator('button:has-text("直前割作成"), button:has-text("直前割編集")')
+    n = buttons.count()
+    if n > 0:
+        print(f"menu_cards: anchor on 直前割 buttons ({n} matches)")
+        return [
+            buttons.nth(i).locator(
+                "xpath=ancestor::*[contains(., '通常料金')][1]"
+            ).first
+            for i in range(n)
+        ]
+
+    for sel in ('[class*="menu-item"]', '[class*="MenuItem"]', '[class*="menu-card"]'):
         loc = page.locator(sel)
         if loc.count() > 0:
+            print(f"menu_cards: fallback selector '{sel}' ({loc.count()} matches)")
             return [loc.nth(i) for i in range(loc.count())]
+    print("menu_cards: no candidates matched")
     return []
 
 
@@ -111,69 +126,60 @@ def card_is_eligible_for_set(card: Locator, keyword: str) -> tuple[bool, str]:
     return True, "ok"
 
 
-def extract_base_price(card: Locator) -> int | None:
-    """Return the ミニモ限定価格 (post-arrow / smaller value), used as the discount base."""
-    text = card_text(card)
-    matches = re.findall(r"[¥￥]\s*([\d,]+)", text)
-    prices: list[int] = []
-    for m in matches:
-        try:
-            prices.append(int(m.replace(",", "")))
-        except ValueError:
-            pass
-    return min(prices) if prices else None
+def _modal(page: Page) -> Locator:
+    modal = page.locator('[role="dialog"], [class*="modal"], [class*="Modal"]').filter(
+        has_text="直前割"
+    ).last
+    modal.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+    return modal
 
 
-def calc_discounted_price(base_price: int) -> int:
-    return math.floor(base_price * (1 - DISCOUNT_RATE_PERCENT / 100))
+def _input_after_label(modal: Locator, label_text: str) -> Locator:
+    """Return the input element that follows the given label text inside the modal."""
+    return modal.locator(
+        f'xpath=.//*[contains(normalize-space(.), "{label_text}")]'
+        f'/following::input[1]'
+    ).first
 
 
 def set_discount_on_card(page: Page, card: Locator) -> None:
-    base_price = extract_base_price(card)
-    if base_price is None:
-        raise RuntimeError("could not parse base price from card")
-    target_price = calc_discounted_price(base_price)
-    print(f"  base={base_price} -> target={target_price}")
+    print(f"  applying {DISCOUNT_RATE_PERCENT}% discount on: {extract_menu_name(card)[:60]}")
 
     card.locator('button:has-text("直前割作成")').first.click()
-    modal = page.locator('[class*="modal"], [role="dialog"]').last
-    modal.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+    modal = _modal(page)
 
-    price_input = modal.locator('input[type="number"], input[type="text"]').filter(
-        has_not=modal.locator('input[disabled], input[readonly]')
-    ).first
-    price_input.fill("")
-    price_input.fill(str(target_price))
-    price_input.press("Tab")
+    rate_input = _input_after_label(modal, "割引率")
+    rate_input.click()
+    rate_input.fill(str(DISCOUNT_RATE_PERCENT))
+    rate_input.press("Tab")
     page.wait_for_timeout(500)
 
-    rate_input = modal.locator('input').filter(has_text="").nth(1)
-    try:
-        rate_value = rate_input.input_value(timeout=2_000)
-        if rate_value and rate_value.isdigit() and int(rate_value) < DISCOUNT_RATE_PERCENT:
-            print(f"  rate auto-calculated to {rate_value}%, correcting to {DISCOUNT_RATE_PERCENT}%")
-            rate_input.fill(str(DISCOUNT_RATE_PERCENT))
-            rate_input.press("Tab")
-            page.wait_for_timeout(500)
-    except PWTimeoutError:
-        pass
-
-    modal.locator('button:has-text("直前割を設定")').first.click()
+    submit = modal.locator('button:has-text("直前割を設定")').first
+    submit.wait_for(state="visible", timeout=5_000)
+    for _ in range(40):
+        if submit.is_enabled():
+            break
+        page.wait_for_timeout(200)
+    else:
+        page.screenshot(path="submit-disabled.png", full_page=True)
+        raise RuntimeError("「直前割を設定」 button stayed disabled — check inputs")
+    submit.click()
     page.wait_for_timeout(1500)
     page.wait_for_load_state("networkidle")
 
 
 def remove_discount_on_card(page: Page, card: Locator) -> None:
+    print(f"  removing discount on: {extract_menu_name(card)[:60]}")
     card.locator('button:has-text("直前割編集")').first.click()
-    modal = page.locator('[class*="modal"], [role="dialog"]').last
-    modal.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-    modal.locator('button:has-text("直前割を終了する")').first.click()
+    modal = _modal(page)
+    modal.get_by_text("直前割を終了する", exact=True).first.click()
+    page.wait_for_timeout(800)
 
     for label in ("終了する", "OK", "はい"):
-        confirm = page.locator(f'button:has-text("{label}")')
+        confirm = page.get_by_role("button", name=label, exact=True)
         try:
-            if confirm.count() > 0:
-                confirm.last.click(timeout=3_000)
+            if confirm.count() > 0 and confirm.first.is_visible(timeout=500):
+                confirm.first.click(timeout=2_000)
                 break
         except PWTimeoutError:
             continue
@@ -181,18 +187,46 @@ def remove_discount_on_card(page: Page, card: Locator) -> None:
     page.wait_for_load_state("networkidle")
 
 
-def run_set(page: Page) -> None:
-    keyword = required_keyword(datetime.now(JST))
-    print(f"set mode (keyword={keyword})")
+def dump_card_names(cards: list[Locator], limit: int = 5) -> None:
+    for i, card in enumerate(cards[:limit]):
+        name = extract_menu_name(card)
+        print(f"  card[{i}] name={name[:80]!r}")
+
+
+def run_set(page: Page, menu_filter: str | None = None) -> None:
     cards = menu_cards(page)
     print(f"found {len(cards)} menu cards")
+    dump_card_names(cards)
+
+    if menu_filter:
+        print(f"set mode: TEST (menu filter='{menu_filter}')")
+        for i, card in enumerate(cards):
+            name = extract_menu_name(card)
+            if menu_filter not in name:
+                continue
+            if card.locator('button:has-text("直前割作成")').count() == 0:
+                print(f"[{i}] matched '{name}' but no 直前割作成 button (already set?)")
+                return
+            print(f"[{i}] test set on: {name}")
+            try:
+                set_discount_on_card(page, card)
+                print("set complete: 1 menu updated (test)")
+            except Exception as e:
+                print(f"[{i}] ERROR: {e}")
+                traceback.print_exc()
+            return
+        print(f"no menu matching '{menu_filter}' found")
+        return
+
+    keyword = required_keyword(datetime.now(JST))
+    print(f"set mode: PRODUCTION (keyword={keyword})")
     processed = 0
     for i, card in enumerate(cards):
         try:
             ok, reason = card_is_eligible_for_set(card, keyword)
             if not ok:
                 continue
-            print(f"[{i}] eligible: {card_text(card).splitlines()[0][:60]}")
+            print(f"[{i}] eligible: {extract_menu_name(card)[:60]}")
             set_discount_on_card(page, card)
             processed += 1
             cards = menu_cards(page)
@@ -202,8 +236,31 @@ def run_set(page: Page) -> None:
     print(f"set complete: {processed} menus updated")
 
 
-def run_remove(page: Page) -> None:
-    print("remove mode")
+def run_remove(page: Page, menu_filter: str | None = None) -> None:
+    if menu_filter:
+        print(f"remove mode: TEST (menu filter='{menu_filter}')")
+        cards = menu_cards(page)
+        print(f"found {len(cards)} menu cards")
+        dump_card_names(cards)
+        for i, card in enumerate(cards):
+            name = extract_menu_name(card)
+            if menu_filter not in name:
+                continue
+            if card.locator('button:has-text("直前割編集")').count() == 0:
+                print(f"[{i}] matched '{name}' but no 直前割編集 button (no discount set)")
+                return
+            print(f"[{i}] test remove on: {name}")
+            try:
+                remove_discount_on_card(page, card)
+                print("remove complete: 1 menu updated (test)")
+            except Exception as e:
+                print(f"[{i}] ERROR: {e}")
+                traceback.print_exc()
+            return
+        print(f"no menu matching '{menu_filter}' found")
+        return
+
+    print("remove mode: PRODUCTION (all menus)")
     processed = 0
     while True:
         cards = menu_cards(page)
@@ -225,9 +282,14 @@ def run_remove(page: Page) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or sys.argv[1] not in ("set", "remove"):
-        sys.exit("usage: minimo_discount.py {set|remove}")
-    action = sys.argv[1]
+    parser = argparse.ArgumentParser(description="minimo last-minute discount automation")
+    parser.add_argument("action", choices=("set", "remove"))
+    parser.add_argument(
+        "--menu",
+        default=os.environ.get("MENU_FILTER", "").strip() or None,
+        help="test mode: only process the menu whose name contains this substring",
+    )
+    args = parser.parse_args()
 
     salon_id = env("MINIMO_SALON_ID")
     password = env("MINIMO_PASSWORD")
@@ -241,10 +303,16 @@ def main() -> None:
         try:
             login(page, salon_id, password)
             open_menu_page(page, staff_hash)
-            if action == "set":
-                run_set(page)
+            if args.action == "set":
+                run_set(page, menu_filter=args.menu)
             else:
-                run_remove(page)
+                run_remove(page, menu_filter=args.menu)
+        except Exception:
+            try:
+                page.screenshot(path="error.png", full_page=True)
+            except Exception:
+                pass
+            raise
         finally:
             context.close()
             browser.close()

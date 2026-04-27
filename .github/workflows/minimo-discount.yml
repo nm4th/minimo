@@ -1,11 +1,6 @@
 name: minimo-discount
 
 on:
-  schedule:
-    # 00:00 JST (= 15:00 UTC previous day): apply last-minute discount
-    - cron: '0 15 * * *'
-    # 18:00 JST (= 09:00 UTC same day): remove last-minute discount
-    - cron: '0 9 * * *'
   workflow_dispatch:
     inputs:
       action:
@@ -16,6 +11,11 @@ on:
         options:
           - set
           - remove
+      menu:
+        description: '(test) substring of menu name to limit to a single menu (e.g. 人気No.2)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run:
@@ -34,18 +34,19 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Determine action
-        id: action
-        run: |
-          case "${{ github.event.schedule }}" in
-            '0 15 * * *') echo "value=set"    >> "$GITHUB_OUTPUT" ;;
-            '0 9 * * *')  echo "value=remove" >> "$GITHUB_OUTPUT" ;;
-            *)            echo "value=${{ inputs.action }}" >> "$GITHUB_OUTPUT" ;;
-          esac
-
       - name: Run
         env:
           MINIMO_SALON_ID:    ${{ secrets.MINIMO_SALON_ID }}
           MINIMO_PASSWORD:    ${{ secrets.MINIMO_PASSWORD }}
           MINIMO_STAFF_HASH:  ${{ secrets.MINIMO_STAFF_HASH }}
-        run: timeout 300 python minimo_discount.py ${{ steps.action.outputs.value }}
+          ACTION:             ${{ inputs.action }}
+          MENU_FILTER:        ${{ inputs.menu }}
+        run: timeout 300 python minimo_discount.py "$ACTION"
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: '*.png'
+          if-no-files-found: ignore
