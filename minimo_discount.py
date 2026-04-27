@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Minimo last-minute discount automation.
+
+Usage:
+    python minimo_discount.py set     # apply 10% last-minute discount to eligible menus
+    python minimo_discount.py remove  # remove all currently-set last-minute discounts
+
+Credentials are read from environment variables:
+    MINIMO_SALON_ID, MINIMO_PASSWORD, MINIMO_STAFF_HASH
+"""
+from __future__ import annotations
+
+import math
+import os
+import sys
+import traceback
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import jpholiday
+from playwright.sync_api import Locator, Page, TimeoutError as PWTimeoutError, sync_playwright
+
+LOGIN_URL = "https://minimodel.jp/salontool/login"
+MENU_URL_TEMPLATE = "https://minimodel.jp/salontool/home#/menu/staff/{staff_hash}/menu"
+DISCOUNT_RATE_PERCENT = 10
+EXCLUDE_NAME_KEYWORDS = ("韓国風", "パリジェンヌ")
+JST = ZoneInfo("Asia/Tokyo")
+DEFAULT_TIMEOUT_MS = 20_000
+
+
+def env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        sys.exit(f"ERROR: missing required env var: {name}")
+    return value
+
+
+def required_keyword(now: datetime) -> str:
+    is_holiday = jpholiday.is_holiday(now.date())
+    is_weekend = now.weekday() >= 5
+    return "土日祝限定" if (is_weekend or is_holiday) else "平日限定"
+
+
+def login(page: Page, salon_id: str, password: str) -> None:
+    page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    page.locator('input[name="loginId"], input[name="salonId"], input[type="text"]').first.fill(salon_id)
+    page.locator('input[type="password"]').first.fill(password)
+    page.locator('button[type="submit"], input[type="submit"]').first.click()
+    page.wait_for_load_state("networkidle")
+    if "login" in page.url:
+        raise RuntimeError(f"login failed (still at {page.url})")
+    print(f"logged in: {page.url}")
+
+
+def open_menu_page(page: Page, staff_hash: str) -> None:
+    page.goto(MENU_URL_TEMPLATE.format(staff_hash=staff_hash), wait_until="networkidle")
+    page.wait_for_timeout(2000)
+
+
+def menu_cards(page: Page) -> list[Locator]:
+    """Each menu row/card. Best-effort selectors; verify on first run."""
+    candidates = [
+        '[class*="menu-item"]',
+        '[class*="MenuItem"]',
+        '[class*="menu-card"]',
+        'li:has(button:has-text("直前割"))',
+        'div:has(> button:has-text("直前割作成"))',
+        'div:has(> button:has-text("直前割編集"))',
+    ]
+    for sel in candidates:
+        loc = page.locator(sel)
+        if loc.count() > 0:
+            return [loc.nth(i) for i in range(loc.count())]
+    return []
+
+
+def card_text(card: Locator) -> str:
+    try:
+        return card.inner_text(timeout=5_000)
+    except PWTimeoutError:
+        return ""
+
+
+def card_is_eligible_for_set(card: Locator, keyword: str) -> tuple[bool, str]:
+    text = card_text(card)
+    if not text:
+        return False, "empty card text"
+    if keyword not in text:
+        return False, f"missing '{keyword}'"
+    if "新規" not in text:
+        return False, "missing '新規'"
+    if "公開停止中" in text:
+        return False, "publication stopped"
+    for ex in EXCLUDE_NAME_KEYWORDS:
+        if ex in text:
+            return False, f"excluded keyword '{ex}'"
+    if card.locator('button:has-text("直前割作成")').count() == 0:
+        return False, "no '直前割作成' button (already set or not applicable)"
+    return True, "ok"
+
+
+def extract_base_price(card: Locator) -> int | None:
+    text = card_text(card)
+    candidates: list[int] = []
+    for line in text.splitlines():
+        digits = "".join(ch for ch in line if ch.isdigit())
+        if "円" in line and digits:
+            try:
+                candidates.append(int(digits))
+            except ValueError:
+                pass
+    return max(candidates) if candidates else None
+
+
+def calc_discounted_price(base_price: int) -> int:
+    return math.floor(base_price * (1 - DISCOUNT_RATE_PERCENT / 100))
+
+
+def set_discount_on_card(page: Page, card: Locator) -> None:
+    base_price = extract_base_price(card)
+    if base_price is None:
+        raise RuntimeError("could not parse base price from card")
+    target_price = calc_discounted_price(base_price)
+    print(f"  base={base_price} -> target={target_price}")
+
+    card.locator('button:has-text("直前割作成")').first.click()
+    modal = page.locator('[class*="modal"], [role="dialog"]').last
+    modal.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+
+    price_input = modal.locator('input[type="number"], input[type="text"]').filter(
+        has_not=modal.locator('input[disabled], input[readonly]')
+    ).first
+    price_input.fill("")
+    price_input.fill(str(target_price))
+    price_input.press("Tab")
+    page.wait_for_timeout(500)
+
+    rate_input = modal.locator('input').filter(has_text="").nth(1)
+    try:
+        rate_value = rate_input.input_value(timeout=2_000)
+        if rate_value and rate_value.isdigit() and int(rate_value) < DISCOUNT_RATE_PERCENT:
+            print(f"  rate auto-calculated to {rate_value}%, correcting to {DISCOUNT_RATE_PERCENT}%")
+            rate_input.fill(str(DISCOUNT_RATE_PERCENT))
+            rate_input.press("Tab")
+            page.wait_for_timeout(500)
+    except PWTimeoutError:
+        pass
+
+    modal.locator('button:has-text("直前割を設定")').first.click()
+    page.wait_for_timeout(1500)
+    page.wait_for_load_state("networkidle")
+
+
+def remove_discount_on_card(page: Page, card: Locator) -> None:
+    card.locator('button:has-text("直前割編集")').first.click()
+    modal = page.locator('[class*="modal"], [role="dialog"]').last
+    modal.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+    modal.locator('button:has-text("直前割を終了する")').first.click()
+
+    for label in ("終了する", "OK", "はい"):
+        confirm = page.locator(f'button:has-text("{label}")')
+        try:
+            if confirm.count() > 0:
+                confirm.last.click(timeout=3_000)
+                break
+        except PWTimeoutError:
+            continue
+    page.wait_for_timeout(1500)
+    page.wait_for_load_state("networkidle")
+
+
+def run_set(page: Page) -> None:
+    keyword = required_keyword(datetime.now(JST))
+    print(f"set mode (keyword={keyword})")
+    cards = menu_cards(page)
+    print(f"found {len(cards)} menu cards")
+    processed = 0
+    for i, card in enumerate(cards):
+        try:
+            ok, reason = card_is_eligible_for_set(card, keyword)
+            if not ok:
+                continue
+            print(f"[{i}] eligible: {card_text(card).splitlines()[0][:60]}")
+            set_discount_on_card(page, card)
+            processed += 1
+            cards = menu_cards(page)
+        except Exception as e:
+            print(f"[{i}] ERROR: {e}")
+            traceback.print_exc()
+    print(f"set complete: {processed} menus updated")
+
+
+def run_remove(page: Page) -> None:
+    print("remove mode")
+    processed = 0
+    while True:
+        cards = menu_cards(page)
+        target = None
+        for card in cards:
+            if card.locator('button:has-text("直前割編集")').count() > 0:
+                target = card
+                break
+        if target is None:
+            break
+        try:
+            remove_discount_on_card(page, target)
+            processed += 1
+        except Exception as e:
+            print(f"ERROR removing discount: {e}")
+            traceback.print_exc()
+            break
+    print(f"remove complete: {processed} menus updated")
+
+
+def main() -> None:
+    if len(sys.argv) != 2 or sys.argv[1] not in ("set", "remove"):
+        sys.exit("usage: minimo_discount.py {set|remove}")
+    action = sys.argv[1]
+
+    salon_id = env("MINIMO_SALON_ID")
+    password = env("MINIMO_PASSWORD")
+    staff_hash = env("MINIMO_STAFF_HASH")
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo")
+        context.set_default_timeout(DEFAULT_TIMEOUT_MS)
+        page = context.new_page()
+        try:
+            login(page, salon_id, password)
+            open_menu_page(page, staff_hash)
+            if action == "set":
+                run_set(page)
+            else:
+                run_remove(page)
+        finally:
+            context.close()
+            browser.close()
+
+
+if __name__ == "__main__":
+    main()
