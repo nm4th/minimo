@@ -69,17 +69,15 @@ def open_menu_page(page: Page, staff_hash: str) -> None:
 
 def menu_cards(page: Page) -> list[Locator]:
     """Find menu rows. Anchor on 直前割 buttons (uniquely present on menu rows)
-    and walk up to the nearest reasonable container; fall back to class-based
-    selectors if buttons aren't found yet."""
+    and walk up to the smallest ancestor that also contains '通常料金' (which
+    every menu card displays). Falls back to class-based selectors."""
     buttons = page.locator('button:has-text("直前割作成"), button:has-text("直前割編集")')
     n = buttons.count()
     if n > 0:
         print(f"menu_cards: anchor on 直前割 buttons ({n} matches)")
         return [
             buttons.nth(i).locator(
-                "xpath=ancestor::*[self::li or self::tr "
-                "or contains(@class,'item') or contains(@class,'card') "
-                "or contains(@class,'row')][1]"
+                "xpath=ancestor::*[contains(., '通常料金')][1]"
             ).first
             for i in range(n)
         ]
@@ -146,6 +144,22 @@ def calc_discounted_price(base_price: int) -> int:
     return math.floor(base_price * (1 - DISCOUNT_RATE_PERCENT / 100))
 
 
+def _modal(page: Page) -> Locator:
+    modal = page.locator('[role="dialog"], [class*="modal"], [class*="Modal"]').filter(
+        has_text="直前割"
+    ).last
+    modal.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+    return modal
+
+
+def _input_after_label(modal: Locator, label_text: str) -> Locator:
+    """Return the input element that follows the given label text inside the modal."""
+    return modal.locator(
+        f'xpath=.//*[contains(normalize-space(.), "{label_text}")]'
+        f'/following::input[1]'
+    ).first
+
+
 def set_discount_on_card(page: Page, card: Locator) -> None:
     base_price = extract_base_price(card)
     if base_price is None:
@@ -154,37 +168,44 @@ def set_discount_on_card(page: Page, card: Locator) -> None:
     print(f"  base={base_price} -> target={target_price}")
 
     card.locator('button:has-text("直前割作成")').first.click()
-    modal = page.locator('[class*="modal"], [role="dialog"]').last
-    modal.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+    modal = _modal(page)
 
-    price_input = modal.locator('input[type="number"], input[type="text"]').filter(
-        has_not=modal.locator('input[disabled], input[readonly]')
-    ).first
+    price_input = _input_after_label(modal, "直前割価格")
+    price_input.click()
     price_input.fill("")
     price_input.fill(str(target_price))
     price_input.press("Tab")
     page.wait_for_timeout(500)
 
-    rate_input = modal.locator('input').filter(has_text="").nth(1)
+    rate_input = _input_after_label(modal, "割引率")
     try:
-        rate_value = rate_input.input_value(timeout=2_000)
+        rate_value = rate_input.input_value(timeout=2_000).strip()
         if rate_value and rate_value.isdigit() and int(rate_value) < DISCOUNT_RATE_PERCENT:
             print(f"  rate auto-calculated to {rate_value}%, correcting to {DISCOUNT_RATE_PERCENT}%")
+            rate_input.click()
             rate_input.fill(str(DISCOUNT_RATE_PERCENT))
             rate_input.press("Tab")
             page.wait_for_timeout(500)
     except PWTimeoutError:
         pass
 
-    modal.locator('button:has-text("直前割を設定")').first.click()
+    submit = modal.locator('button:has-text("直前割を設定")').first
+    submit.wait_for(state="visible", timeout=5_000)
+    for _ in range(40):
+        if submit.is_enabled():
+            break
+        page.wait_for_timeout(200)
+    else:
+        page.screenshot(path="submit-disabled.png", full_page=True)
+        raise RuntimeError("「直前割を設定」 button stayed disabled — check inputs")
+    submit.click()
     page.wait_for_timeout(1500)
     page.wait_for_load_state("networkidle")
 
 
 def remove_discount_on_card(page: Page, card: Locator) -> None:
     card.locator('button:has-text("直前割編集")').first.click()
-    modal = page.locator('[class*="modal"], [role="dialog"]').last
-    modal.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+    modal = _modal(page)
     modal.locator('button:has-text("直前割を終了する")').first.click()
 
     for label in ("終了する", "OK", "はい"):
