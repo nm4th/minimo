@@ -1,0 +1,51 @@
+name: minimo-discount
+
+on:
+  schedule:
+    # 00:00 JST (= 15:00 UTC previous day): apply last-minute discount
+    - cron: '0 15 * * *'
+    # 18:00 JST (= 09:00 UTC same day): remove last-minute discount
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'set | remove'
+        required: true
+        default: 'set'
+        type: choice
+        options:
+          - set
+          - remove
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Determine action
+        id: action
+        run: |
+          case "${{ github.event.schedule }}" in
+            '0 15 * * *') echo "value=set"    >> "$GITHUB_OUTPUT" ;;
+            '0 9 * * *')  echo "value=remove" >> "$GITHUB_OUTPUT" ;;
+            *)            echo "value=${{ inputs.action }}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Run
+        env:
+          MINIMO_SALON_ID:    ${{ secrets.MINIMO_SALON_ID }}
+          MINIMO_PASSWORD:    ${{ secrets.MINIMO_PASSWORD }}
+          MINIMO_STAFF_HASH:  ${{ secrets.MINIMO_STAFF_HASH }}
+        run: timeout 300 python minimo_discount.py ${{ steps.action.outputs.value }}
