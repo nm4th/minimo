@@ -16,6 +16,11 @@ on:
         options:
           - set
           - remove
+      menu:
+        description: '(test) substring of menu name to limit to a single menu (e.g. 人気No.2)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run:
@@ -48,4 +53,6 @@ jobs:
           MINIMO_SALON_ID:    ${{ secrets.MINIMO_SALON_ID }}
           MINIMO_PASSWORD:    ${{ secrets.MINIMO_PASSWORD }}
           MINIMO_STAFF_HASH:  ${{ secrets.MINIMO_STAFF_HASH }}
-        run: timeout 300 python minimo_discount.py ${{ steps.action.outputs.value }}
+          ACTION:             ${{ steps.action.outputs.value }}
+          MENU_FILTER:        ${{ inputs.menu }}
+        run: timeout 300 python minimo_discount.py "$ACTION"

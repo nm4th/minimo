@@ -2,14 +2,21 @@
 """Minimo last-minute discount automation.
 
 Usage:
-    python minimo_discount.py set     # apply 10% last-minute discount to eligible menus
-    python minimo_discount.py remove  # remove all currently-set last-minute discounts
+    python minimo_discount.py set                 # apply discount to all eligible menus
+    python minimo_discount.py remove              # remove discount from all menus
+    python minimo_discount.py set --menu "人気No.2"     # test: only that one menu
+    python minimo_discount.py remove --menu "人気No.2"  # test: only that one menu
+
+In test mode (--menu / MENU_FILTER env), only the menu whose name contains the given
+substring is processed, and eligibility filters (平日限定 / 新規 / exclude keywords)
+are skipped — only the required button presence is checked.
 
 Credentials are read from environment variables:
     MINIMO_SALON_ID, MINIMO_PASSWORD, MINIMO_STAFF_HASH
 """
 from __future__ import annotations
 
+import argparse
 import math
 import os
 import re
@@ -181,18 +188,39 @@ def remove_discount_on_card(page: Page, card: Locator) -> None:
     page.wait_for_load_state("networkidle")
 
 
-def run_set(page: Page) -> None:
-    keyword = required_keyword(datetime.now(JST))
-    print(f"set mode (keyword={keyword})")
+def run_set(page: Page, menu_filter: str | None = None) -> None:
     cards = menu_cards(page)
     print(f"found {len(cards)} menu cards")
+
+    if menu_filter:
+        print(f"set mode: TEST (menu filter='{menu_filter}')")
+        for i, card in enumerate(cards):
+            name = extract_menu_name(card)
+            if menu_filter not in name:
+                continue
+            if card.locator('button:has-text("直前割作成")').count() == 0:
+                print(f"[{i}] matched '{name}' but no 直前割作成 button (already set?)")
+                return
+            print(f"[{i}] test set on: {name}")
+            try:
+                set_discount_on_card(page, card)
+                print("set complete: 1 menu updated (test)")
+            except Exception as e:
+                print(f"[{i}] ERROR: {e}")
+                traceback.print_exc()
+            return
+        print(f"no menu matching '{menu_filter}' found")
+        return
+
+    keyword = required_keyword(datetime.now(JST))
+    print(f"set mode: PRODUCTION (keyword={keyword})")
     processed = 0
     for i, card in enumerate(cards):
         try:
             ok, reason = card_is_eligible_for_set(card, keyword)
             if not ok:
                 continue
-            print(f"[{i}] eligible: {card_text(card).splitlines()[0][:60]}")
+            print(f"[{i}] eligible: {extract_menu_name(card)[:60]}")
             set_discount_on_card(page, card)
             processed += 1
             cards = menu_cards(page)
@@ -202,8 +230,29 @@ def run_set(page: Page) -> None:
     print(f"set complete: {processed} menus updated")
 
 
-def run_remove(page: Page) -> None:
-    print("remove mode")
+def run_remove(page: Page, menu_filter: str | None = None) -> None:
+    if menu_filter:
+        print(f"remove mode: TEST (menu filter='{menu_filter}')")
+        cards = menu_cards(page)
+        for i, card in enumerate(cards):
+            name = extract_menu_name(card)
+            if menu_filter not in name:
+                continue
+            if card.locator('button:has-text("直前割編集")').count() == 0:
+                print(f"[{i}] matched '{name}' but no 直前割編集 button (no discount set)")
+                return
+            print(f"[{i}] test remove on: {name}")
+            try:
+                remove_discount_on_card(page, card)
+                print("remove complete: 1 menu updated (test)")
+            except Exception as e:
+                print(f"[{i}] ERROR: {e}")
+                traceback.print_exc()
+            return
+        print(f"no menu matching '{menu_filter}' found")
+        return
+
+    print("remove mode: PRODUCTION (all menus)")
     processed = 0
     while True:
         cards = menu_cards(page)
@@ -225,9 +274,14 @@ def run_remove(page: Page) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or sys.argv[1] not in ("set", "remove"):
-        sys.exit("usage: minimo_discount.py {set|remove}")
-    action = sys.argv[1]
+    parser = argparse.ArgumentParser(description="minimo last-minute discount automation")
+    parser.add_argument("action", choices=("set", "remove"))
+    parser.add_argument(
+        "--menu",
+        default=os.environ.get("MENU_FILTER", "").strip() or None,
+        help="test mode: only process the menu whose name contains this substring",
+    )
+    args = parser.parse_args()
 
     salon_id = env("MINIMO_SALON_ID")
     password = env("MINIMO_PASSWORD")
@@ -241,10 +295,10 @@ def main() -> None:
         try:
             login(page, salon_id, password)
             open_menu_page(page, staff_hash)
-            if action == "set":
-                run_set(page)
+            if args.action == "set":
+                run_set(page, menu_filter=args.menu)
             else:
-                run_remove(page)
+                run_remove(page, menu_filter=args.menu)
         finally:
             context.close()
             browser.close()

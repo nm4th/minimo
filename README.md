@@ -31,7 +31,21 @@ minimoサロンツールの「直前割」を GitHub Actions のスケジュー�
 
 GitHub の **Actions → minimo-discount → Run workflow** から `set` / `remove` を選んで即時実行できます。
 
-ローカルで動かす場合：
+### テスト実行（1メニューだけ）
+
+挙動確認用に、対象メニューを1件に絞れます。
+
+- **GitHub Actions UI**: Run workflow 画面の `menu` 欄にメニュー名の一部（例: `人気No.2`）を入力 → そのメニュー1件にだけ `set` / `remove` を実行
+- **ローカル**: `--menu` フラグ
+
+```sh
+python minimo_discount.py set --menu "人気No.2"     # 1件だけ直前割を設定
+python minimo_discount.py remove --menu "人気No.2"  # 1件だけ解除
+```
+
+テストモードでは平日限定／新規／除外キーワードのチェックはスキップし、対象ボタン（直前割作成 / 直前割編集）の有無だけ確認して実行します。
+
+### 通常のローカル実行
 
 ```sh
 pip install -r requirements.txt
