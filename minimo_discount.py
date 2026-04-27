@@ -63,22 +63,33 @@ def login(page: Page, salon_id: str, password: str) -> None:
 def open_menu_page(page: Page, staff_hash: str) -> None:
     page.goto(MENU_URL_TEMPLATE.format(staff_hash=staff_hash), wait_until="networkidle")
     page.wait_for_timeout(2000)
+    print(f"menu page url: {page.url}")
+    page.screenshot(path="menu-page.png", full_page=True)
 
 
 def menu_cards(page: Page) -> list[Locator]:
-    """Each menu row/card. Best-effort selectors; verify on first run."""
-    candidates = [
-        '[class*="menu-item"]',
-        '[class*="MenuItem"]',
-        '[class*="menu-card"]',
-        'li:has(button:has-text("直前割"))',
-        'div:has(> button:has-text("直前割作成"))',
-        'div:has(> button:has-text("直前割編集"))',
-    ]
-    for sel in candidates:
+    """Find menu rows. Anchor on 直前割 buttons (uniquely present on menu rows)
+    and walk up to the nearest reasonable container; fall back to class-based
+    selectors if buttons aren't found yet."""
+    buttons = page.locator('button:has-text("直前割作成"), button:has-text("直前割編集")')
+    n = buttons.count()
+    if n > 0:
+        print(f"menu_cards: anchor on 直前割 buttons ({n} matches)")
+        return [
+            buttons.nth(i).locator(
+                "xpath=ancestor::*[self::li or self::tr "
+                "or contains(@class,'item') or contains(@class,'card') "
+                "or contains(@class,'row')][1]"
+            ).first
+            for i in range(n)
+        ]
+
+    for sel in ('[class*="menu-item"]', '[class*="MenuItem"]', '[class*="menu-card"]'):
         loc = page.locator(sel)
         if loc.count() > 0:
+            print(f"menu_cards: fallback selector '{sel}' ({loc.count()} matches)")
             return [loc.nth(i) for i in range(loc.count())]
+    print("menu_cards: no candidates matched")
     return []
 
 
@@ -188,9 +199,16 @@ def remove_discount_on_card(page: Page, card: Locator) -> None:
     page.wait_for_load_state("networkidle")
 
 
+def dump_card_names(cards: list[Locator], limit: int = 5) -> None:
+    for i, card in enumerate(cards[:limit]):
+        name = extract_menu_name(card)
+        print(f"  card[{i}] name={name[:80]!r}")
+
+
 def run_set(page: Page, menu_filter: str | None = None) -> None:
     cards = menu_cards(page)
     print(f"found {len(cards)} menu cards")
+    dump_card_names(cards)
 
     if menu_filter:
         print(f"set mode: TEST (menu filter='{menu_filter}')")
@@ -234,6 +252,8 @@ def run_remove(page: Page, menu_filter: str | None = None) -> None:
     if menu_filter:
         print(f"remove mode: TEST (menu filter='{menu_filter}')")
         cards = menu_cards(page)
+        print(f"found {len(cards)} menu cards")
+        dump_card_names(cards)
         for i, card in enumerate(cards):
             name = extract_menu_name(card)
             if menu_filter not in name:
@@ -299,6 +319,12 @@ def main() -> None:
                 run_set(page, menu_filter=args.menu)
             else:
                 run_remove(page, menu_filter=args.menu)
+        except Exception:
+            try:
+                page.screenshot(path="error.png", full_page=True)
+            except Exception:
+                pass
+            raise
         finally:
             context.close()
             browser.close()

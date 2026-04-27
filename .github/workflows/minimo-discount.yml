@@ -56,3 +56,11 @@ jobs:
           ACTION:             ${{ steps.action.outputs.value }}
           MENU_FILTER:        ${{ inputs.menu }}
         run: timeout 300 python minimo_discount.py "$ACTION"
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: '*.png'
+          if-no-files-found: ignore
