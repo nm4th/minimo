@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 import traceback
 from datetime import datetime
@@ -81,6 +82,16 @@ def card_text(card: Locator) -> str:
         return ""
 
 
+def extract_menu_name(card: Locator) -> str:
+    """Extract menu name. Heuristic: line starting with 【...】, since menu names
+    in this account follow that pattern (e.g., 【平日限定】..., 【土日祝限定】...)."""
+    text = card_text(card)
+    match = re.search(r"【[^】]*】[^\n]*", text)
+    if match:
+        return match.group(0).strip()
+    return max((ln.strip() for ln in text.splitlines() if ln.strip()), key=len, default="")
+
+
 def card_is_eligible_for_set(card: Locator, keyword: str) -> tuple[bool, str]:
     text = card_text(card)
     if not text:
@@ -91,25 +102,26 @@ def card_is_eligible_for_set(card: Locator, keyword: str) -> tuple[bool, str]:
         return False, "missing '新規'"
     if "公開停止中" in text:
         return False, "publication stopped"
+    name = extract_menu_name(card)
     for ex in EXCLUDE_NAME_KEYWORDS:
-        if ex in text:
-            return False, f"excluded keyword '{ex}'"
+        if ex in name:
+            return False, f"excluded keyword '{ex}' in menu name"
     if card.locator('button:has-text("直前割作成")').count() == 0:
         return False, "no '直前割作成' button (already set or not applicable)"
     return True, "ok"
 
 
 def extract_base_price(card: Locator) -> int | None:
+    """Return the ミニモ限定価格 (post-arrow / smaller value), used as the discount base."""
     text = card_text(card)
-    candidates: list[int] = []
-    for line in text.splitlines():
-        digits = "".join(ch for ch in line if ch.isdigit())
-        if "円" in line and digits:
-            try:
-                candidates.append(int(digits))
-            except ValueError:
-                pass
-    return max(candidates) if candidates else None
+    matches = re.findall(r"[¥￥]\s*([\d,]+)", text)
+    prices: list[int] = []
+    for m in matches:
+        try:
+            prices.append(int(m.replace(",", "")))
+        except ValueError:
+            pass
+    return min(prices) if prices else None
 
 
 def calc_discounted_price(base_price: int) -> int:
