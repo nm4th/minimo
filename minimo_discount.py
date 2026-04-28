@@ -17,6 +17,7 @@ Credentials are read from environment variables:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import sys
@@ -142,6 +143,65 @@ def _input_after_label(modal: Locator, label_text: str) -> Locator:
     ).first
 
 
+def _wait_enabled(page: Page, locator: Locator, timeout_ms: int) -> bool:
+    poll = 200
+    for _ in range(max(1, timeout_ms // poll)):
+        try:
+            if locator.is_enabled(timeout=500):
+                return True
+        except PWTimeoutError:
+            pass
+        page.wait_for_timeout(poll)
+    return False
+
+
+def _modal_target_price(modal: Locator) -> int | None:
+    """Compute target discount price from prices shown in the modal's menu summary."""
+    try:
+        text = modal.inner_text(timeout=2_000)
+    except PWTimeoutError:
+        return None
+    matches = re.findall(r"[¥￥]\s*([\d,]+)", text)
+    prices: list[int] = []
+    for m in matches:
+        try:
+            prices.append(int(m.replace(",", "")))
+        except ValueError:
+            pass
+    if not prices:
+        return None
+    base = min(prices)
+    return math.floor(base * (1 - DISCOUNT_RATE_PERCENT / 100))
+
+
+def _try_close_modal(page: Page) -> None:
+    """Best-effort: close any open dialog so the next menu's click isn't blocked."""
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+    try:
+        close = page.locator(
+            '[role="dialog"] button[aria-label*="閉じる"], '
+            '[role="dialog"] button[aria-label*="close" i], '
+            '[role="dialog"] button:has-text("×")'
+        )
+        if close.count() > 0 and close.first.is_visible(timeout=500):
+            close.first.click(timeout=1_000)
+            page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+
+def _fill_input(page: Page, inp: Locator, value: str) -> None:
+    inp.click()
+    inp.fill("")
+    inp.fill(value)
+    inp.press("Tab")
+    page.wait_for_timeout(400)
+
+
 def set_discount_on_card(page: Page, card: Locator) -> None:
     print(f"  applying {DISCOUNT_RATE_PERCENT}% discount on: {extract_menu_name(card)[:60]}")
 
@@ -149,20 +209,34 @@ def set_discount_on_card(page: Page, card: Locator) -> None:
     modal = _modal(page)
 
     rate_input = _input_after_label(modal, "割引率")
-    rate_input.click()
-    rate_input.fill(str(DISCOUNT_RATE_PERCENT))
-    rate_input.press("Tab")
-    page.wait_for_timeout(500)
-
+    price_input = _input_after_label(modal, "直前割価格")
     submit = modal.locator('button:has-text("直前割を設定")').first
     submit.wait_for(state="visible", timeout=5_000)
-    for _ in range(40):
-        if submit.is_enabled():
-            break
-        page.wait_for_timeout(200)
-    else:
-        page.screenshot(path="submit-disabled.png", full_page=True)
-        raise RuntimeError("「直前割を設定」 button stayed disabled — check inputs")
+
+    _fill_input(page, rate_input, str(DISCOUNT_RATE_PERCENT))
+
+    # Some modals don't auto-fill price from the rate change (likely React state
+    # not seeing fill() as a real edit), so submit stays disabled. Fall back to
+    # filling the price ourselves.
+    if not _wait_enabled(page, submit, timeout_ms=3_000):
+        target_price = _modal_target_price(modal)
+        try:
+            current_price = price_input.input_value(timeout=1_000)
+            current_rate = rate_input.input_value(timeout=1_000)
+        except PWTimeoutError:
+            current_price, current_rate = "?", "?"
+        print(f"  submit disabled (rate='{current_rate}', price='{current_price}'); "
+              f"filling price={target_price} as fallback")
+        if target_price is None:
+            page.screenshot(path="submit-disabled.png", full_page=True)
+            raise RuntimeError("could not derive target price for fallback")
+        _fill_input(page, price_input, str(target_price))
+        # Re-fill rate too in case it was cleared by price input.
+        _fill_input(page, rate_input, str(DISCOUNT_RATE_PERCENT))
+        if not _wait_enabled(page, submit, timeout_ms=5_000):
+            page.screenshot(path="submit-disabled.png", full_page=True)
+            raise RuntimeError("「直前割を設定」 button stayed disabled — check inputs")
+
     submit.click()
     page.wait_for_timeout(1500)
     page.wait_for_load_state("networkidle")
@@ -214,6 +288,7 @@ def run_set(page: Page, menu_filter: str | None = None) -> None:
             except Exception as e:
                 print(f"[{i}] ERROR: {e}")
                 traceback.print_exc()
+                _try_close_modal(page)
             return
         print(f"no menu matching '{menu_filter}' found")
         return
@@ -233,6 +308,8 @@ def run_set(page: Page, menu_filter: str | None = None) -> None:
         except Exception as e:
             print(f"[{i}] ERROR: {e}")
             traceback.print_exc()
+            _try_close_modal(page)
+            cards = menu_cards(page)
     print(f"set complete: {processed} menus updated")
 
 
@@ -256,13 +333,15 @@ def run_remove(page: Page, menu_filter: str | None = None) -> None:
             except Exception as e:
                 print(f"[{i}] ERROR: {e}")
                 traceback.print_exc()
+                _try_close_modal(page)
             return
         print(f"no menu matching '{menu_filter}' found")
         return
 
     print("remove mode: PRODUCTION (all menus)")
     processed = 0
-    while True:
+    consecutive_errors = 0
+    while consecutive_errors < 3:
         cards = menu_cards(page)
         target = None
         for card in cards:
@@ -274,10 +353,12 @@ def run_remove(page: Page, menu_filter: str | None = None) -> None:
         try:
             remove_discount_on_card(page, target)
             processed += 1
+            consecutive_errors = 0
         except Exception as e:
             print(f"ERROR removing discount: {e}")
             traceback.print_exc()
-            break
+            _try_close_modal(page)
+            consecutive_errors += 1
     print(f"remove complete: {processed} menus updated")
 
 
