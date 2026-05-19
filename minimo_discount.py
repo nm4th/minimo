@@ -60,11 +60,75 @@ def login(page: Page, salon_id: str, password: str) -> None:
     print(f"logged in: {page.url}")
 
 
+def _react_modal_overlay(page: Page) -> Locator:
+    return page.locator(".ReactModal__Overlay--after-open, [class*='modal_overlay']")
+
+
+def _is_overlay_visible(page: Page) -> bool:
+    overlay = _react_modal_overlay(page)
+    try:
+        return overlay.count() > 0 and overlay.first.is_visible(timeout=500)
+    except Exception:
+        return False
+
+
+def _dismiss_startup_modal(page: Page) -> None:
+    """A startup announcement / onboarding / TOS modal blocks every click on
+    the menu page if not dismissed first. Try common dismiss buttons; if all
+    fail, save a screenshot so we can see what to add to the list."""
+    if not _is_overlay_visible(page):
+        return
+
+    print("startup modal detected on menu page; attempting dismissal")
+    page.screenshot(path="startup-modal.png", full_page=True)
+
+    candidates = [
+        'button[aria-label="閉じる"]',
+        'button[aria-label*="閉じる"]',
+        'button[aria-label*="close" i]',
+        'button:has-text("閉じる")',
+        'button:has-text("OK")',
+        'button:has-text("はい")',
+        'button:has-text("了解")',
+        'button:has-text("確認")',
+        'button:has-text("スキップ")',
+        'button:has-text("あとで")',
+        'button:has-text("今はしない")',
+        'button:has-text("×")',
+        '.ReactModal__Content button[class*="close"]',
+    ]
+    for sel in candidates:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=300):
+                btn.click(timeout=2_000)
+                page.wait_for_timeout(500)
+                if not _is_overlay_visible(page):
+                    print(f"  dismissed via selector: {sel}")
+                    return
+        except Exception:
+            continue
+
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    if _is_overlay_visible(page):
+        print(
+            "  WARNING: could not dismiss the startup modal. "
+            "Check startup-modal.png in artifacts to see what minimo is showing, "
+            "then add the dismiss button text to the candidates list."
+        )
+
+
 def open_menu_page(page: Page, staff_hash: str) -> None:
     page.goto(MENU_URL_TEMPLATE.format(staff_hash=staff_hash), wait_until="networkidle")
     page.wait_for_timeout(2000)
     print(f"menu page url: {page.url}")
     page.screenshot(path="menu-page.png", full_page=True)
+    _dismiss_startup_modal(page)
 
 
 def menu_cards(page: Page) -> list[Locator]:
@@ -175,23 +239,33 @@ def _modal_target_price(modal: Locator) -> int | None:
 
 
 def _try_close_modal(page: Page) -> None:
-    """Best-effort: close any open dialog so the next menu's click isn't blocked."""
+    """Best-effort: close any open dialog so the next menu's click isn't blocked.
+    Includes the ReactModal overlay used by minimo for all modals."""
+    if not _is_overlay_visible(page):
+        return
     try:
         page.keyboard.press("Escape")
         page.wait_for_timeout(300)
     except Exception:
         pass
-    try:
-        close = page.locator(
-            '[role="dialog"] button[aria-label*="閉じる"], '
-            '[role="dialog"] button[aria-label*="close" i], '
-            '[role="dialog"] button:has-text("×")'
-        )
-        if close.count() > 0 and close.first.is_visible(timeout=500):
-            close.first.click(timeout=1_000)
-            page.wait_for_timeout(300)
-    except Exception:
-        pass
+    if not _is_overlay_visible(page):
+        return
+    for sel in (
+        '.ReactModal__Content button[aria-label*="閉じる"]',
+        '.ReactModal__Content button[aria-label*="close" i]',
+        '.ReactModal__Content button:has-text("×")',
+        '[role="dialog"] button[aria-label*="閉じる"]',
+        '[role="dialog"] button:has-text("×")',
+    ):
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=300):
+                btn.click(timeout=1_000)
+                page.wait_for_timeout(300)
+                if not _is_overlay_visible(page):
+                    return
+        except Exception:
+            continue
 
 
 def _fill_input(page: Page, inp: Locator, value: str) -> None:
