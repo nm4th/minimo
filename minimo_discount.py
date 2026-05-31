@@ -61,25 +61,53 @@ def login(page: Page, salon_id: str, password: str) -> None:
 
 
 def _react_modal_overlay(page: Page) -> Locator:
-    return page.locator(".ReactModal__Overlay--after-open, [class*='modal_overlay']")
+    return page.locator(
+        ".ReactModal__Overlay--after-open, "
+        ".ReactModal__Overlay, "
+        "[class*='a_modal_overlay']"
+    )
 
 
 def _is_overlay_visible(page: Page) -> bool:
     overlay = _react_modal_overlay(page)
     try:
-        return overlay.count() > 0 and overlay.first.is_visible(timeout=500)
+        return overlay.count() > 0 and overlay.first.is_visible(timeout=1_000)
     except Exception:
         return False
 
 
+def _purge_overlay_via_js(page: Page) -> bool:
+    """Last-resort: remove ReactModalPortal nodes from the DOM directly.
+    Used when the modal has no findable dismiss button."""
+    try:
+        removed = page.evaluate(
+            """() => {
+                let n = 0;
+                document.querySelectorAll(
+                    '.ReactModalPortal, .ReactModal__Overlay, [class*=\"a_modal_overlay\"]'
+                ).forEach(el => { el.remove(); n++; });
+                document.documentElement.style.overflow = '';
+                document.body.style.overflow = '';
+                document.body.style.position = '';
+                return n;
+            }"""
+        )
+        if removed:
+            print(f"  force-removed {removed} overlay element(s) via JS")
+            return True
+    except Exception as e:
+        print(f"  JS overlay removal error: {e}")
+    return False
+
+
 def _dismiss_startup_modal(page: Page) -> None:
-    """A startup announcement / onboarding / TOS modal blocks every click on
-    the menu page if not dismissed first. Try common dismiss buttons; if all
-    fail, save a screenshot so we can see what to add to the list."""
+    """The minimo menu page sometimes lifts a ReactModal overlay on top of
+    everything (announcement / TOS / onboarding). Try common dismiss buttons,
+    then Escape, and finally rip the overlay out of the DOM."""
     if not _is_overlay_visible(page):
         return
 
-    print("startup modal detected on menu page; attempting dismissal")
+    print("startup modal detected; attempting dismissal")
     page.screenshot(path="startup-modal.png", full_page=True)
 
     candidates = [
@@ -115,12 +143,16 @@ def _dismiss_startup_modal(page: Page) -> None:
     except Exception:
         pass
 
+    if not _is_overlay_visible(page):
+        print("  dismissed via Escape")
+        return
+
+    print("  standard dismissal failed; force-removing overlay from DOM")
+    _purge_overlay_via_js(page)
+    page.wait_for_timeout(300)
+
     if _is_overlay_visible(page):
-        print(
-            "  WARNING: could not dismiss the startup modal. "
-            "Check startup-modal.png in artifacts to see what minimo is showing, "
-            "then add the dismiss button text to the candidates list."
-        )
+        print("  WARNING: overlay still present after force-removal")
 
 
 def open_menu_page(page: Page, staff_hash: str) -> None:
@@ -277,6 +309,7 @@ def _fill_input(page: Page, inp: Locator, value: str) -> None:
 
 
 def set_discount_on_card(page: Page, card: Locator) -> None:
+    _dismiss_startup_modal(page)
     print(f"  applying {DISCOUNT_RATE_PERCENT}% discount on: {extract_menu_name(card)[:60]}")
 
     card.locator('button:has-text("直前割作成")').first.click()
@@ -317,6 +350,7 @@ def set_discount_on_card(page: Page, card: Locator) -> None:
 
 
 def remove_discount_on_card(page: Page, card: Locator) -> None:
+    _dismiss_startup_modal(page)
     print(f"  removing discount on: {extract_menu_name(card)[:60]}")
     card.locator('button:has-text("直前割編集")').first.click()
     modal = _modal(page)
