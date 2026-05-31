@@ -164,25 +164,23 @@ def open_menu_page(page: Page, staff_hash: str) -> None:
 
 
 def menu_cards(page: Page) -> list[Locator]:
-    """Find menu rows. Anchor on 直前割 buttons (uniquely present on menu rows)
-    and walk up to the smallest ancestor that also contains '通常料金' (which
-    every menu card displays). Falls back to class-based selectors."""
+    """Each menu row is `<div class="o_menu_card">`. Confirmed against the real DOM."""
+    cards = page.locator(".o_menu_card")
+    n = cards.count()
+    if n > 0:
+        print(f"menu_cards: .o_menu_card ({n} matches)")
+        return [cards.nth(i) for i in range(n)]
+
     buttons = page.locator('button:has-text("直前割作成"), button:has-text("直前割編集")')
     n = buttons.count()
     if n > 0:
-        print(f"menu_cards: anchor on 直前割 buttons ({n} matches)")
+        print(f"menu_cards: fallback anchor on 直前割 buttons ({n} matches)")
         return [
             buttons.nth(i).locator(
                 "xpath=ancestor::*[contains(., '通常料金')][1]"
             ).first
             for i in range(n)
         ]
-
-    for sel in ('[class*="menu-item"]', '[class*="MenuItem"]', '[class*="menu-card"]'):
-        loc = page.locator(sel)
-        if loc.count() > 0:
-            print(f"menu_cards: fallback selector '{sel}' ({loc.count()} matches)")
-            return [loc.nth(i) for i in range(loc.count())]
     print("menu_cards: no candidates matched")
     return []
 
@@ -195,8 +193,13 @@ def card_text(card: Locator) -> str:
 
 
 def extract_menu_name(card: Locator) -> str:
-    """Extract menu name. Heuristic: line starting with 【...】, since menu names
-    in this account follow that pattern (e.g., 【平日限定】..., 【土日祝限定】...)."""
+    """The menu name lives in `<div class="o_menu_card_menu_name">` per the real DOM."""
+    name_el = card.locator(".o_menu_card_menu_name")
+    try:
+        if name_el.count() > 0:
+            return name_el.first.inner_text(timeout=2_000).strip()
+    except PWTimeoutError:
+        pass
     text = card_text(card)
     match = re.search(r"【[^】]*】[^\n]*", text)
     if match:
